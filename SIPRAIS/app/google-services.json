@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "1060589192074",
+    "firebase_url": "https://projectsiprai-default-rtdb.firebaseio.com",
+    "project_id": "projectsiprai",
+    "storage_bucket": "projectsiprai.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1060589192074:android:43d14f7d200e6823ecfe73",
+        "android_client_info": {
+          "package_name": "com.example.siprais"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC6UTSjuKC0X_hheN5wM9rIhabOkqmYxto"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
