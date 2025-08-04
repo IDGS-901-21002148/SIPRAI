@@ -1,0 +1,179 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+#include <ScioSense_ENS160.h>
+#include "config.h"
+
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
+
+Adafruit_AHTX0 aht;
+ScioSense_ENS160 ens160;
+
+bool bomba_manual = false;
+bool ventilador_manual_override = false;
+bool ventilador_estado_manual = false;
+bool ventilador_activo = false;
+
+bool boton_anterior = HIGH;
+unsigned long ultimo_boton = 0;
+const unsigned long debounce_delay = 100;
+
+void setup_wifi();
+void reconnect_mqtt();
+void mqtt_callback(char* topic, byte* payload, unsigned int length);
+
+void setup() {
+  Serial.begin(BAUD_RATE);
+
+  pinMode(PIN_RELE_VENTILADOR, OUTPUT);
+  pinMode(PIN_RELE_BOMBA, OUTPUT);
+  pinMode(PIN_MQ2_GAS, INPUT);
+  pinMode(PIN_SENSOR_FLAMA, INPUT);
+  pinMode(PIN_TOUCH_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_BUZZER, OUTPUT);
+
+  digitalWrite(PIN_RELE_VENTILADOR, LOW);
+  digitalWrite(PIN_RELE_BOMBA, LOW);
+  digitalWrite(PIN_BUZZER, LOW);
+
+  Wire.begin();
+
+  if (!aht.begin()) Serial.println("Error al iniciar AHT21");
+  if (ens160.begin() != 0) Serial.println("Error al iniciar ENS160");
+
+  setup_wifi();
+
+  espClient.setInsecure();
+  client.setServer(MQTT_SERVER, MQTT_PORT);
+  client.setCallback(mqtt_callback);
+
+  Serial.println("Sistema listo.");
+}
+
+void loop() {
+  if (!client.connected()) reconnect_mqtt();
+  client.loop();
+
+  float temperatura = NAN, humedad = NAN;
+  sensors_event_t temp_event, hum_event;
+  aht.getEvent(&hum_event, &temp_event);
+  temperatura = temp_event.temperature;
+  humedad = hum_event.relative_humidity;
+
+  int raw_gas = analogRead(PIN_MQ2_GAS);
+  int gas_percent = map(raw_gas, 0, 4095, 0, 100);
+  bool flama = (digitalRead(PIN_SENSOR_FLAMA) == LOW);
+
+  bool boton_actual = digitalRead(PIN_TOUCH_BUTTON);
+  if (boton_anterior == HIGH && boton_actual == LOW && millis() - ultimo_boton > debounce_delay) {
+    bomba_manual = !bomba_manual;
+    ultimo_boton = millis();
+    Serial.print("[BOTÓN] bomba_manual: ");
+    Serial.println(bomba_manual ? "ENCENDIDA" : "APAGADA");
+  }
+  boton_anterior = boton_actual;
+
+  // Activación de la bomba
+  bool bomba_on = bomba_manual || flama;
+  digitalWrite(PIN_RELE_BOMBA, bomba_on ? HIGH : LOW);
+  digitalWrite(PIN_BUZZER, bomba_on ? HIGH : LOW);
+
+  // Control del ventilador
+  if (!ventilador_manual_override) {
+    if (gas_percent >= limites_actuales.gas_alto_porcentaje) {
+      ventilador_activo = true;
+    } else if (gas_percent <= (limites_actuales.gas_alto_porcentaje - GAS_HISTERESIS)) {
+      ventilador_activo = false;
+    }
+    digitalWrite(PIN_RELE_VENTILADOR, ventilador_activo ? HIGH : LOW);
+  } else {
+    digitalWrite(PIN_RELE_VENTILADOR, ventilador_estado_manual ? HIGH : LOW);
+  }
+
+  // Enviar datos por MQTT
+  if (client.connected()) {
+    client.publish(MQTT_TOPIC_TEMP, isnan(temperatura) ? "nan" : String(temperatura, 2).c_str(), true);
+    client.publish(MQTT_TOPIC_HUM, isnan(humedad) ? "nan" : String(humedad, 2).c_str(), true);
+    client.publish(MQTT_TOPIC_GAS, String(gas_percent).c_str(), true);
+    client.publish(MQTT_TOPIC_FLAME, flama ? "1" : "0", true);
+  }
+
+  // Enviar ALERTAS por MQTT y conteo para la app
+  static bool bomba_estado_anterior = false;
+  static bool ventilador_estado_anterior = false;
+  static bool flama_anterior = false;
+
+  if (bomba_on != bomba_estado_anterior) {
+    bomba_estado_anterior = bomba_on;
+    String alerta = bomba_on ? "🚨 Bomba de agua ACTIVADA" : "✅ Bomba de agua DESACTIVADA";
+    client.publish(MQTT_TOPIC_ALERTAS, alerta.c_str());
+  }
+
+  bool ventilador_actual = (ventilador_manual_override ? ventilador_estado_manual : ventilador_activo);
+  if (ventilador_actual != ventilador_estado_anterior) {
+    ventilador_estado_anterior = ventilador_actual;
+    String alerta = ventilador_actual ? "💨 Ventilador ENCENDIDO" : "💨 Ventilador APAGADO";
+    client.publish(MQTT_TOPIC_ALERTAS, alerta.c_str());
+  }
+
+  if (flama != flama_anterior) {
+    flama_anterior = flama;
+    if (flama) {
+      client.publish(MQTT_TOPIC_ALERTAS, "🔥 ¡FUEGO DETECTADO!");
+    } else {
+      client.publish(MQTT_TOPIC_ALERTAS, "🔥 Fuego controlado.");
+    }
+  }
+
+  // Mostrar en consola
+  Serial.printf("Temp: %.1f °C, Hum: %.1f %%, Gas: %d %%, Flama: %s | Bomba: %s | Ventilador: %s\n",
+    temperatura, humedad, gas_percent, flama ? "🔥" : "No", bomba_on ? "ON" : "OFF", ventilador_actual ? "ON" : "OFF");
+
+  delay(500);
+}
+
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (uint i = 0; i < length; i++) msg += (char)payload[i];
+  msg.trim();
+
+  Serial.printf("[MQTT] Mensaje recibido en %s: %s\n", topic, msg.c_str());
+
+  if (String(topic) == MQTT_TOPIC_CONTROL) {
+    if (msg == "bomba_on") bomba_manual = true;
+    else if (msg == "bomba_off") bomba_manual = false;
+    else if (msg == "ventilador_on") {
+      ventilador_manual_override = true;
+      ventilador_estado_manual = true;
+    } else if (msg == "ventilador_off") {
+      ventilador_manual_override = true;
+      ventilador_estado_manual = false;
+    }
+  }
+}
+
+void setup_wifi() {
+  Serial.print("Conectando a WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.printf("\nWiFi conectado. IP: %s\n", WiFi.localIP().toString().c_str());
+}
+
+void reconnect_mqtt() {
+  while (!client.connected()) {
+    Serial.print("[MQTT] Intentando conectar...");
+    if (client.connect("ESP32Client", MQTT_USER, MQTT_PASS)) {
+      Serial.println("conectado.");
+      client.subscribe(MQTT_TOPIC_CONTROL);
+    } else {
+      Serial.printf("falló. Código: %d\n", client.state());
+      delay(5000);
+    }
+  }
+}
